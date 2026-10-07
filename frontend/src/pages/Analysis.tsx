@@ -25,6 +25,7 @@ import FieldGroup from '../components/common/FieldGroup';
 import { useLocalDraft } from '../hooks/useLocalDraft';
 import { useSampleStore } from '../stores/sampleStore';
 import { useToastStore } from '../stores/uiStore';
+import { RecordGoneError } from '../db';
 import {
   ANALYSIS_METHODS,
   ANALYSIS_METHOD_LABELS,
@@ -71,8 +72,10 @@ export default function Analysis() {
     [],
   );
 
-  const { value, patch, reset, clear, restored } = useLocalDraft<AnalysisDraft>('analysis-entry', initial);
+  const { value, patch, reset, commit, restored, restoredSource } =
+    useLocalDraft<AnalysisDraft>('analysis-entry', initial);
   const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
 
   const sampleSections = useMemo(
     () => sections.filter((s) => s.sampleId === value.sampleId),
@@ -93,20 +96,38 @@ export default function Analysis() {
       return;
     }
     setError(null);
-    await addAnalysis({
-      sampleId: value.sampleId,
-      sectionId: value.target === 'section' ? value.sectionId : undefined,
-      target: value.target,
-      method: value.method,
-      fa: Number(value.fa),
-      fs: Number(value.fs),
-      ni: Number(value.ni),
-      kamaciteBandwidth: Number(value.kamaciteBandwidth),
-      testedAt: value.testedAt,
-    });
-    clear();
-    notify('检测记录已写入本地库');
-    patch({ fa: 18.5, fs: 16, ni: 0.8, kamaciteBandwidth: 0.05 });
+    setSaving(true);
+    try {
+      await addAnalysis({
+        sampleId: value.sampleId,
+        sectionId: value.target === 'section' ? value.sectionId : undefined,
+        target: value.target,
+        method: value.method,
+        fa: Number(value.fa),
+        fs: Number(value.fs),
+        ni: Number(value.ni),
+        kamaciteBandwidth: Number(value.kamaciteBandwidth),
+        testedAt: value.testedAt,
+      });
+      // 落库成功才清草稿；失败则表单原样保留，刷新页面也能恢复
+      commit();
+      notify('检测记录已写入本地库');
+      patch({ fa: 18.5, fs: 16, ni: 0.8, kamaciteBandwidth: 0.05 });
+    } catch (err) {
+      if (err instanceof RecordGoneError) {
+        setError(
+          err.table === 'samples'
+            ? '关联样本已被另一个窗口删除，记录未写入，草稿已保留。请改选样本后重试。'
+            : '关联切片已被另一个窗口删除，记录未写入，草稿已保留。请改选切片后重试。',
+        );
+        notify('保存失败：关联对象已被另一窗口删除', 'error');
+      } else {
+        setError(`写入本地库失败（${err instanceof Error ? err.message : '未知错误'}），草稿已保留，可重试。`);
+        notify('保存失败，草稿已保留', 'error');
+      }
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -119,7 +140,11 @@ export default function Analysis() {
       </Box>
 
       {restored ? (
-        <Alert severity="info">已从本地草稿恢复上次未提交的检测录入（localStorage 草稿键 analysis-entry）。</Alert>
+        <Alert severity="info">
+          {restoredSource === 'self'
+            ? '已恢复本窗口上次未提交的检测录入。'
+            : '已接续上一个已关闭窗口留下的未提交检测草稿（各窗口分槽保存，互不覆盖）。'}
+        </Alert>
       ) : null}
       {error ? <Alert severity="error">{error}</Alert> : null}
 
@@ -254,10 +279,16 @@ export default function Analysis() {
               </Stack>
 
               <Stack direction="row" spacing={1.5}>
-                <Button variant="contained" startIcon={<SaveIcon />} onClick={submit} id="save-analysis">
-                  保存检测记录
+                <Button
+                  variant="contained"
+                  startIcon={<SaveIcon />}
+                  onClick={() => void submit()}
+                  id="save-analysis"
+                  disabled={saving}
+                >
+                  {saving ? '保存中…' : '保存检测记录'}
                 </Button>
-                <Button variant="outlined" onClick={reset}>
+                <Button variant="outlined" onClick={reset} disabled={saving}>
                   清空并重置草稿
                 </Button>
               </Stack>

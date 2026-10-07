@@ -24,6 +24,19 @@ docker compose down
 - 所有数据保存在浏览器本地：业务数据走 **IndexedDB（Dexie，库名 `gbmeteorite-db`）**，表单草稿走 **localStorage**
 - 容器无状态，不挂载任何命名卷；换浏览器即换档案库
 
+## 多窗口协同（两人同时录同一批样本）
+
+标本室常出现两个窗口同时登记、互相覆盖与编号撞号，应用对此做了三件事：
+
+1. **写入即同步**：任一窗口写库后经 `BroadcastChannel`（不支持时降级为 `storage` 事件）通知其它窗口，
+   对方重查 IndexedDB 并整体刷新内存快照，样本总览 / 详情 / 切片库 / 分析检测 / 发现地分布及其统计（重量合计、地区聚合、筛选计数）自动重算。
+2. **撞号与覆盖保护**：样本编号、切片编号在写入事务内复查，两窗口同时保存同一编号时后提交方被拦下并提示换号；
+   更新类操作（样本存放状态、切片批量标注）带 `updatedAt` 乐观锁，拿着旧数据保存会弹出冲突对话框，
+   可「载入最新内容」或在知情后「仍要覆盖保存」，不会静默盖掉对方结果。
+3. **草稿分槽与失败保留**：每个窗口的表单草稿写入独立 localStorage 槽（`gbmeteorite:draft:<表单>:<窗口id>`），
+   两人同时录互不覆盖；写入失败（撞号、对方已改、库不可用）草稿原样保留，刷新或重开自动恢复，
+   已关闭窗口遗留的草稿会被新窗口接续；只有保存成功才清理。样本与发现地在同一事务写入，不会留半成品。
+
 ## 技术栈
 
 | 层次 | 选型 |
@@ -73,11 +86,11 @@ sologsb-1125/
         ├── types/{sample,find,section,analysis}.ts
         ├── db/index.ts                 # Dexie 封装与 v1→v3 升级迁移
         ├── stores/{sampleStore,uiStore}.ts
-        ├── components/common/{SampleCard,Badge,FieldGroup,EmptyState,CoordinatePicker,AppShell}.tsx
-        ├── hooks/{useSampleFilter,useLocalDraft,useRegionStats}.ts
+        ├── components/common/{SampleCard,Badge,FieldGroup,EmptyState,CoordinatePicker,AppShell,ConflictDialog}.tsx
+        ├── hooks/{useSampleFilter,useLocalDraft,useRegionStats,useRemoteSync}.ts
         ├── pages/{Overview,New,Detail,Sections,Analysis,Locations}.tsx
         ├── router/index.tsx
-        └── utils/{classify,format,geo}.ts
+        └── utils/{classify,format,geo,tab,syncBus,diff}.ts
 ```
 
 ## 数据存储说明
@@ -87,7 +100,10 @@ sologsb-1125/
   - v1 建 `samples` / `finds` / `sections`
   - v2 新增 `analysis` 表并加 `sampleId` 索引
   - v3 为 `samples` 补 `updatedAt` 字段并按 id 回填旧记录
-- **草稿**：`/samples/new` 与 `/analysis` 的表单草稿写入 localStorage（键前缀 `gbmeteorite:draft:`），切页自动恢复，提交后清理
+  - v4 为 `sections` 补 `updatedAt`（乐观锁）并回填旧切片
+- **编号唯一性**：`sampleNo` / `sectionNo` 在写入事务内按值复查（不建 unique 索引，避免历史脏数据阻断迁移）
+- **草稿**：`/samples/new`、`/analysis` 与样本详情的就地切片/检测表单均写 localStorage 草稿，
+  按窗口 id 分槽（键前缀 `gbmeteorite:draft:`），切页/刷新/写入失败均可恢复，提交成功后清理本窗口槽
 - 首次打开会灌入 3 份演示样本、2 条发现记录、2 张切片与 2 条检测记录，便于直接体验筛选与打点
 
 ## 环境变量

@@ -17,6 +17,16 @@ export function formatDate(value: number | string): string {
   return `${y}-${m}-${day}`;
 }
 
+/** 含时分的时间戳（冲突对话框展示版本时间） */
+export function formatDateTime(value: number): string {
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return '—';
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `${formatDate(value)} ${hh}:${mm}:${ss}`;
+}
+
 /** 数值保留小数位，空值统一显示为短横线 */
 export function formatNumber(value: number | undefined | null, digits = 2, unit = ''): string {
   if (value === undefined || value === null || Number.isNaN(Number(value))) return '—';

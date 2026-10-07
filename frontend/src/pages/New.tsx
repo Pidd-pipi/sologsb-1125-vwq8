@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Alert,
   Box,
@@ -14,12 +14,14 @@ import {
 } from '@mui/material';
 import SaveIcon from '@mui/icons-material/Save';
 import RestartAltIcon from '@mui/icons-material/RestartAlt';
+import AutorenewIcon from '@mui/icons-material/Autorenew';
 import { useNavigate } from 'react-router-dom';
 import FieldGroup from '../components/common/FieldGroup';
 import CoordinatePicker from '../components/common/CoordinatePicker';
 import { useLocalDraft } from '../hooks/useLocalDraft';
 import { useSampleStore } from '../stores/sampleStore';
 import { useToastStore } from '../stores/uiStore';
+import { DuplicateNoError } from '../db';
 import {
   CHEMICAL_GROUP_LABELS,
   CHEMICAL_GROUPS,
@@ -71,14 +73,15 @@ interface FormDraft {
 /** `/samples/new` 样本登记 */
 export default function New() {
   const navigate = useNavigate();
-  const nextSeq = useSampleStore((s) => s.nextSampleSeq);
-  const addSample = useSampleStore((s) => s.addSample);
-  const addFind = useSampleStore((s) => s.addFind);
+  const nextSampleSeq = useSampleStore((s) => s.nextSampleSeq);
+  const registerSample = useSampleStore((s) => s.registerSample);
+  const samples = useSampleStore((s) => s.samples);
   const notify = useToastStore((s) => s.notify);
 
+  // 编号初始占位；挂载后改为直接查库的实时序号（另一窗口刚登记也能看到）
   const initial = useMemo<FormDraft>(
     () => ({
-      sampleNo: generateSampleNo(new Date().getFullYear(), nextSeq()),
+      sampleNo: generateSampleNo(new Date().getFullYear(), 1),
       totalWeight: 0,
       category: 'chondrite',
       chemicalGroup: 'H',
@@ -95,11 +98,43 @@ export default function New() {
       environment: 'desert',
       finder: '',
     }),
-    [nextSeq],
+    [],
   );
 
-  const { value, patch, reset, clear, restored } = useLocalDraft<FormDraft>('sample-new', initial);
+  const { value, patch, reset, commit, restored, restoredSource } = useLocalDraft<FormDraft>(
+    'sample-new',
+    initial,
+  );
   const [errors, setErrors] = useState<string[]>([]);
+  const [duplicate, setDuplicate] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  // 首次进入（非恢复草稿）时，用库中实时序号生成建议编号，避免与另一窗口撞号
+  useEffect(() => {
+    if (restored) return;
+    let cancelled = false;
+    void nextSampleSeq().then((seq) => {
+      if (!cancelled && seq > 1) {
+        patch({ sampleNo: generateSampleNo(new Date().getFullYear(), seq) });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+    // 只在挂载时取一次；之后由“生成下一个编号”按钮按需刷新
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const regenerateNo = async () => {
+    const seq = await nextSampleSeq();
+    patch({ sampleNo: generateSampleNo(new Date().getFullYear(), seq) });
+    setDuplicate(null);
+  };
+
+  // 另一窗口可能抢先登记了同一编号：在本页即时给出预警（保存时事务内还有一次权威复查）
+  const noTakenBy = value.sampleNo.trim()
+    ? samples.find((s) => s.sampleNo === value.sampleNo.trim())
+    : undefined;
 
   const coordError = value.withFind ? validateCoordinate(value.longitude, value.latitude) : null;
 
@@ -118,33 +153,52 @@ export default function New() {
     setErrors(list);
     if (list.length) return;
 
-    const sampleId = await addSample({
-      sampleNo: value.sampleNo.trim(),
-      totalWeight: Number(value.totalWeight),
-      category: value.category,
-      chemicalGroup: value.chemicalGroup,
-      weathering: value.weathering,
-      fallOrFind: value.fallOrFind,
-      storage: value.storage,
-      note: value.note.trim() || undefined,
-    });
-
-    if (value.withFind) {
-      await addFind({
-        sampleId,
-        placeName: value.placeName.trim(),
-        region: value.region.trim(),
-        longitude: Number(value.longitude),
-        latitude: Number(value.latitude),
-        coordinateSource: value.coordinateSource,
-        environment: value.environment,
-        finder: value.finder.trim() || '未署名',
-      });
+    setSaving(true);
+    setDuplicate(null);
+    try {
+      const sampleNo = value.sampleNo.trim();
+      const { sampleId } = await registerSample(
+        {
+          sampleNo,
+          totalWeight: Number(value.totalWeight),
+          category: value.category,
+          chemicalGroup: value.chemicalGroup,
+          weathering: value.weathering,
+          fallOrFind: value.fallOrFind,
+          storage: value.storage,
+          note: value.note.trim() || undefined,
+        },
+        value.withFind
+          ? {
+              placeName: value.placeName.trim(),
+              region: value.region.trim(),
+              longitude: Number(value.longitude),
+              latitude: Number(value.latitude),
+              coordinateSource: value.coordinateSource,
+              environment: value.environment,
+              finder: value.finder.trim() || '未署名',
+            }
+          : undefined,
+      );
+      // 只有真正落库成功才清草稿；失败时下面的 catch 保留现场
+      commit();
+      notify(`已登记样本 ${sampleNo}`);
+      navigate(`/samples/${sampleId}`);
+    } catch (err) {
+      if (err instanceof DuplicateNoError) {
+        setDuplicate(
+          `编号 ${err.no} 已被另一条档案占用（可能是另一个窗口刚登记）。样本与发现地均未写入，表单内容已保留，请改用新编号后再保存。`,
+        );
+        notify('样本编号与另一窗口撞号，请更换编号', 'error');
+      } else {
+        setErrors([
+          `写入本地库失败（${err instanceof Error ? err.message : '未知错误'}），草稿仍保留在本窗口，可重试。`,
+        ]);
+        notify('保存失败，草稿已保留', 'error');
+      }
+    } finally {
+      setSaving(false);
     }
-
-    clear();
-    notify(`已登记样本 ${value.sampleNo.trim()}`);
-    navigate(`/samples/${sampleId}`);
   };
 
   return (
@@ -158,7 +212,33 @@ export default function New() {
 
       {restored ? (
         <Alert severity="info">
-          已从本地草稿恢复上次未提交的录入内容（localStorage：gbmeteorite:draft:sample-new）。
+          {restoredSource === 'self'
+            ? '已恢复本窗口上次未提交的录入内容。'
+            : '已接续上一个已关闭窗口留下的未提交草稿（各窗口草稿分槽保存，不会互相覆盖）。'}
+        </Alert>
+      ) : null}
+      {duplicate ? (
+        <Alert
+          severity="error"
+          action={
+            <Button color="inherit" size="small" startIcon={<AutorenewIcon />} onClick={() => void regenerateNo()}>
+              生成新编号
+            </Button>
+          }
+        >
+          {duplicate}
+        </Alert>
+      ) : null}
+      {!duplicate && noTakenBy ? (
+        <Alert
+          severity="warning"
+          action={
+            <Button color="inherit" size="small" startIcon={<AutorenewIcon />} onClick={() => void regenerateNo()}>
+              换一个编号
+            </Button>
+          }
+        >
+          编号 {value.sampleNo.trim()} 已存在（{noTakenBy.id}），保存会被拦下，很可能是另一个窗口刚登记了同一编号。
         </Alert>
       ) : null}
       {errors.length ? (
@@ -184,7 +264,7 @@ export default function New() {
               <Button
                 size="small"
                 variant="outlined"
-                onClick={() => patch({ sampleNo: generateSampleNo(new Date().getFullYear(), nextSeq()) })}
+                onClick={() => void regenerateNo()}
                 sx={{ alignSelf: 'flex-start' }}
               >
                 生成下一个编号
@@ -389,10 +469,16 @@ export default function New() {
       </Grid>
 
       <Stack direction="row" spacing={1.5}>
-        <Button variant="contained" startIcon={<SaveIcon />} onClick={submit} id="save-sample">
-          保存样本档案
+        <Button
+          variant="contained"
+          startIcon={<SaveIcon />}
+          onClick={() => void submit()}
+          id="save-sample"
+          disabled={saving}
+        >
+          {saving ? '保存中…' : '保存样本档案'}
         </Button>
-        <Button variant="outlined" startIcon={<RestartAltIcon />} onClick={reset}>
+        <Button variant="outlined" startIcon={<RestartAltIcon />} onClick={reset} disabled={saving}>
           清空并重置草稿
         </Button>
       </Stack>

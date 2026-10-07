@@ -12,6 +12,10 @@ export const DB_NAME = 'gbmeteorite-db';
  *  - v1：建 samples / finds / sections 三张表
  *  - v2：新增 analysis 表，并为 analysis 加 sampleId 索引
  *  - v3：为 samples 补 updatedAt 字段，并按 id 回填旧记录
+ *  - v4：为 sections 补 updatedAt 字段（跨窗口乐观锁），并回填旧切片
+ *
+ * 注：编号唯一性（sampleNo / sectionNo）在写入事务内按值复查，
+ * 不建 unique 索引，避免历史脏数据导致迁移失败。
  */
 export class MeteoriteDB extends Dexie {
   samples!: Table<MeteoriteSample, string>;
@@ -65,10 +69,74 @@ export class MeteoriteDB extends Dexie {
             }
           });
       });
+
+    this.version(4)
+      .stores({
+        samples:
+          'id, sampleNo, category, chemicalGroup, totalWeight, createdAt, updatedAt',
+        finds: 'id, sampleId, region, createdAt',
+        sections: 'id, sectionNo, sampleId, thickness, createdAt',
+        analysis: 'id, sampleId, sectionId, method, testedAt, createdAt',
+      })
+      .upgrade(async (tx) => {
+        // v4：为切片表补 updatedAt，并按 id 回填旧切片
+        await tx
+          .table<ThinSection, string>('sections')
+          .toCollection()
+          .modify((section) => {
+            if (typeof section.updatedAt !== 'number') {
+              section.updatedAt =
+                typeof section.createdAt === 'number' ? section.createdAt : Date.now();
+            }
+          });
+      });
   }
 }
 
 export const db = new MeteoriteDB();
+
+export type ChangeTableName = 'samples' | 'sections';
+
+/** 编号已被其它记录占用（事务内复查失败） */
+export class DuplicateNoError extends Error {
+  /** 已占用该编号的既有记录（可能由另一窗口刚写入） */
+  existing: { id: string; createdAt: number; updatedAt: number };
+  constructor(
+    public readonly kind: 'sample' | 'section',
+    public readonly no: string,
+    existing: { id: string; createdAt: number; updatedAt: number },
+  ) {
+    super(kind === 'sample' ? `样本编号 ${no} 已存在` : `切片编号 ${no} 已存在`);
+    this.name = 'DuplicateNoError';
+    this.existing = existing;
+  }
+}
+
+/** 记录在保存时已不存在（可能被另一窗口删除） */
+export class RecordGoneError extends Error {
+  constructor(
+    public readonly table: ChangeTableName,
+    public readonly id: string,
+  ) {
+    super(`记录 ${id} 已不存在`);
+    this.name = 'RecordGoneError';
+  }
+}
+
+/** 乐观锁失败：记录自本窗口读取后已被其它窗口修改 */
+export class StaleWriteError extends Error {
+  constructor(
+    public readonly table: ChangeTableName,
+    public readonly id: string,
+    public readonly expectedUpdatedAt: number,
+    /** 库中最新版本时间，供界面展示「对方什么时候改的」 */
+    public readonly currentUpdatedAt: number,
+  ) {
+    super(`记录已被其它窗口修改（基准 ${expectedUpdatedAt}，最新 ${currentUpdatedAt}）`);
+    this.name = 'StaleWriteError';
+  }
+}
+
 
 /** 生成一个稳定的本地 id */
 export function makeId(prefix: string): string {
@@ -78,10 +146,14 @@ export function makeId(prefix: string): string {
 
 /** 首次运行时灌入演示档案，保证页面有可检索内容 */
 export async function seedIfEmpty(): Promise<void> {
-  const count = await db.samples.count();
-  if (count > 0) return;
+  // 外层快判，避免每次启动都开事务
+  const quick = await db.samples.count();
+  if (quick > 0) return;
   const now = Date.now();
   await db.transaction('rw', db.samples, db.finds, db.sections, db.analysis, async () => {
+    // 事务内复查：两个窗口首次同时打开时，rw 事务串行执行，
+    // 后到的窗口在这里会看到已提交的种子，避免重复写入撞主键
+    if ((await db.samples.count()) > 0) return;
     await db.samples.bulkAdd([
       {
         id: 'sample_seed_1',
@@ -160,6 +232,7 @@ export async function seedIfEmpty(): Promise<void> {
         micrographs: ['met001_ppl.jpg', 'met001_xpl.jpg'],
         quality: 'good',
         createdAt: now - 86400000 * 35,
+        updatedAt: now - 86400000 * 35,
       },
       {
         id: 'section_seed_2',
@@ -171,6 +244,7 @@ export async function seedIfEmpty(): Promise<void> {
         micrographs: ['met002_reflect.jpg'],
         quality: 'fair',
         createdAt: now - 86400000 * 25,
+        updatedAt: now - 86400000 * 25,
       },
     ]);
     await db.analysis.bulkAdd([

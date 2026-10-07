@@ -21,6 +21,7 @@ import ClassificationBadge from '../components/common/Badge';
 import { useSampleFilter } from '../hooks/useSampleFilter';
 import { useSampleStore } from '../stores/sampleStore';
 import { useToastStore } from '../stores/uiStore';
+import { RecordGoneError, StaleWriteError } from '../db';
 import {
   MINERAL_KEYS,
   MINERAL_LABELS,
@@ -45,9 +46,12 @@ export default function Sections() {
   const [mineralKey, setMineralKey] = useState<(typeof MINERAL_KEYS)[number] | ''>('');
   const [mineralMin, setMineralMin] = useState<number | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
+  const [staleNos, setStaleNos] = useState<string[]>([]);
+  const [labeling, setLabeling] = useState(false);
 
   const sampleMap = useMemo(() => new Map(samples.map((s) => [s.id, s])), [samples]);
   const visibleSampleIds = useMemo(() => new Set(results.map((s) => s.id)), [results]);
+  const sectionMap = useMemo(() => new Map(sections.map((s) => [s.id, s])), [sections]);
 
   const filtered = useMemo(
     () =>
@@ -67,9 +71,40 @@ export default function Sections() {
 
   const bulkLabel = async (quality: SectionQuality) => {
     if (!selected.length) return;
-    await Promise.all(selected.map((id) => updateSection(id, { quality })));
-    notify(`已批量标注 ${selected.length} 张切片为「${SECTION_QUALITY_LABELS[quality]}」`);
-    setSelected([]);
+    setLabeling(true);
+    setStaleNos([]);
+    const stale: string[] = [];
+    const ok: string[] = [];
+    // 逐张带基准版本更新：被另一窗口改过或删除的切片会被单独拦下，
+    // 其余切片正常标注，绝不拿旧数据覆盖对方
+    for (const id of selected) {
+      const sec = sectionMap.get(id);
+      try {
+        await updateSection(
+          id,
+          { quality },
+          { expectedUpdatedAt: sec?.updatedAt ?? sec?.createdAt },
+        );
+        ok.push(id);
+      } catch (err) {
+        if (err instanceof StaleWriteError) {
+          stale.push(sec?.sectionNo ?? id);
+        } else if (err instanceof RecordGoneError) {
+          stale.push(`${sec?.sectionNo ?? id}（已删除）`);
+        } else {
+          stale.push(`${sec?.sectionNo ?? id}（写入失败）`);
+        }
+      }
+    }
+    setSelected(ok.length ? selected.filter((id) => !ok.includes(id)) : selected);
+    if (stale.length) {
+      setStaleNos(stale);
+      notify(`${ok.length} 张已标注；${stale.length} 张被另一窗口改动未覆盖：${stale.join('、')}`, 'warning');
+    } else {
+      notify(`已批量标注 ${selected.length} 张切片为「${SECTION_QUALITY_LABELS[quality]}」`);
+      setSelected([]);
+    }
+    setLabeling(false);
   };
 
   return (
@@ -132,7 +167,13 @@ export default function Sections() {
             <Stack direction="row" spacing={1} alignItems="center">
               <Typography variant="caption">已选 {selected.length} 张，批量标注：</Typography>
               {SECTION_QUALITIES.filter((q) => q !== 'unrated').map((q) => (
-                <Button key={q} size="small" variant="outlined" onClick={() => void bulkLabel(q)}>
+                <Button
+                  key={q}
+                  size="small"
+                  variant="outlined"
+                  onClick={() => void bulkLabel(q)}
+                  disabled={labeling}
+                >
                   {SECTION_QUALITY_LABELS[q].split('（')[0]}
                 </Button>
               ))}
@@ -140,6 +181,12 @@ export default function Sections() {
           ) : null}
         </Stack>
       </Paper>
+
+      {staleNos.length ? (
+        <Alert severity="warning" onClose={() => setStaleNos([])}>
+          以下切片自本页面加载后已被另一个窗口修改或删除，未覆盖对方内容：{staleNos.join('、')}。请刷新查看最新状态后重新勾选标注。
+        </Alert>
+      ) : null}
 
       {filtered.length === 0 ? (
         <EmptyState

@@ -22,8 +22,11 @@ import SampleCard from '../components/common/SampleCard';
 import FieldGroup from '../components/common/FieldGroup';
 import ClassificationBadge from '../components/common/Badge';
 import EmptyState from '../components/common/EmptyState';
+import ConflictDialog, { type ConflictInfo } from '../components/common/ConflictDialog';
+import { useLocalDraft } from '../hooks/useLocalDraft';
 import { useSampleStore } from '../stores/sampleStore';
 import { useToastStore } from '../stores/uiStore';
+import { DuplicateNoError, RecordGoneError, StaleWriteError } from '../db';
 import {
   ANALYSIS_METHODS,
   ANALYSIS_METHOD_LABELS,
@@ -51,6 +54,25 @@ import { FIND_ENVIRONMENT_LABELS, COORDINATE_SOURCE_LABELS } from '../types/find
 import { classifyByAnalysis, evaluateThresholds } from '../utils/classify';
 import { formatDate, formatNumber, formatWeight } from '../utils/format';
 import { formatCoordinate } from '../utils/geo';
+import { diffRecords } from '../utils/diff';
+
+interface SectionFormDraft {
+  sectionNo: string;
+  thickness: number;
+  preparation: PreparationMethod;
+  quality: SectionQuality;
+  micrograph: string;
+  minerals: MineralRatios;
+}
+
+interface AnalysisFormDraft {
+  method: AnalysisMethod;
+  fa: number;
+  fs: number;
+  ni: number;
+  kamaciteBandwidth: number;
+  testedAt: string;
+}
 
 /** `/samples/:id` 样本详情 */
 export default function Detail() {
@@ -69,29 +91,45 @@ export default function Detail() {
   const mySections = useMemo(() => sections.filter((s) => s.sampleId === id), [sections, id]);
   const myAnalysis = useMemo(() => analysis.filter((a) => a.sampleId === id), [analysis, id]);
 
-  const [sectionDraft, setSectionDraft] = useState({
-    sectionNo: '',
-    thickness: 30,
-    preparation: 'resin' as PreparationMethod,
-    quality: 'unrated' as SectionQuality,
-    micrograph: '',
-    minerals: { olivine: 40, pyroxene: 25, feldspar: 15, metal: 20 } as MineralRatios,
-  });
-  const [analysisDraft, setAnalysisDraft] = useState({
-    method: 'microprobe' as AnalysisMethod,
-    fa: 18,
-    fs: 16,
-    ni: 0.8,
-    kamaciteBandwidth: 0.05,
-    testedAt: new Date().toISOString().slice(0, 10),
-  });
+  // 就地表单同样走分槽草稿：切页 / 刷新 / 意外中断后回来还能接着录
+  const sectionInitial = useMemo<SectionFormDraft>(
+    () => ({
+      sectionNo: '',
+      thickness: 30,
+      preparation: 'resin',
+      quality: 'unrated',
+      micrograph: '',
+      minerals: { olivine: 40, pyroxene: 25, feldspar: 15, metal: 20 },
+    }),
+    [],
+  );
+  const analysisInitial = useMemo<AnalysisFormDraft>(
+    () => ({
+      method: 'microprobe',
+      fa: 18,
+      fs: 16,
+      ni: 0.8,
+      kamaciteBandwidth: 0.05,
+      testedAt: new Date().toISOString().slice(0, 10),
+    }),
+    [],
+  );
+
+  const sectionForm = useLocalDraft<SectionFormDraft>(`detail-section:${id}`, sectionInitial);
+  const analysisForm = useLocalDraft<AnalysisFormDraft>(`detail-analysis:${id}`, analysisInitial);
+  const { value: sectionDraft, patch: patchSection, commit: commitSection } = sectionForm;
+  const { value: analysisDraft, patch: patchAnalysis, commit: commitAnalysis } = analysisForm;
+
+  const [formError, setFormError] = useState<string | null>(null);
+  const [conflict, setConflict] = useState<ConflictInfo | null>(null);
+  const [pendingToggle, setPendingToggle] = useState(false);
 
   if (!sample) {
     return (
       <Stack spacing={2}>
         <EmptyState
           title="未找到该样本档案"
-          description={`样本 id「${id}」不在本地库中，可能已被删除或链接失效。`}
+          description={`样本 id「${id}」不在本地库中，可能已被另一个窗口删除或链接失效。`}
           actionLabel="返回样本总览"
           actionTo="/"
         />
@@ -104,32 +142,101 @@ export default function Detail() {
   const hits = evaluateThresholds(analysisDraft);
 
   const submitSection = async () => {
-    const no = sectionDraft.sectionNo.trim() || `TS-${new Date().getFullYear()}-${mySections.length + 1}`.padEnd(3, '0');
-    await addSection({
-      sectionNo: no,
-      sampleId: sample.id,
-      thickness: Number(sectionDraft.thickness),
-      preparation: sectionDraft.preparation,
-      minerals: sectionDraft.minerals,
-      micrographs: sectionDraft.micrograph.trim() ? [sectionDraft.micrograph.trim()] : [],
-      quality: sectionDraft.quality,
-    });
-    notify(`已为 ${sample.sampleNo} 新增切片 ${no}`);
-    setSectionDraft((d) => ({ ...d, sectionNo: '', micrograph: '' }));
+    setFormError(null);
+    const no =
+      sectionDraft.sectionNo.trim() ||
+      `TS-${new Date().getFullYear()}-${String(mySections.length + 1).padStart(3, '0')}`;
+    try {
+      await addSection({
+        sectionNo: no,
+        sampleId: sample.id,
+        thickness: Number(sectionDraft.thickness),
+        preparation: sectionDraft.preparation,
+        minerals: sectionDraft.minerals,
+        micrographs: sectionDraft.micrograph.trim() ? [sectionDraft.micrograph.trim()] : [],
+        quality: sectionDraft.quality,
+      });
+      commitSection();
+      notify(`已为 ${sample.sampleNo} 新增切片 ${no}`);
+    } catch (err) {
+      if (err instanceof DuplicateNoError) {
+        setFormError(
+          `切片编号 ${err.no} 已存在（可能是另一个窗口刚录入），本次未写入，表单内容已保留，请改编号后重试。`,
+        );
+        notify('切片编号撞号，请更换', 'error');
+      } else if (err instanceof RecordGoneError) {
+        setFormError('该样本已被另一个窗口删除，切片未写入，草稿已保留。');
+        notify('样本已被另一窗口删除', 'error');
+      } else {
+        setFormError(`写入失败（${err instanceof Error ? err.message : '未知错误'}），草稿已保留。`);
+        notify('保存失败，草稿已保留', 'error');
+      }
+    }
   };
 
   const submitAnalysis = async () => {
-    await addAnalysis({
-      sampleId: sample.id,
-      target: 'sample',
-      method: analysisDraft.method,
-      fa: Number(analysisDraft.fa),
-      fs: Number(analysisDraft.fs),
-      ni: Number(analysisDraft.ni),
-      kamaciteBandwidth: Number(analysisDraft.kamaciteBandwidth),
-      testedAt: analysisDraft.testedAt,
-    });
-    notify(`已为 ${sample.sampleNo} 写入一条检测记录`);
+    setFormError(null);
+    try {
+      await addAnalysis({
+        sampleId: sample.id,
+        target: 'sample',
+        method: analysisDraft.method,
+        fa: Number(analysisDraft.fa),
+        fs: Number(analysisDraft.fs),
+        ni: Number(analysisDraft.ni),
+        kamaciteBandwidth: Number(analysisDraft.kamaciteBandwidth),
+        testedAt: analysisDraft.testedAt,
+      });
+      commitAnalysis();
+      notify(`已为 ${sample.sampleNo} 写入一条检测记录`);
+    } catch (err) {
+      if (err instanceof RecordGoneError) {
+        setFormError('该样本已被另一个窗口删除，检测记录未写入，草稿已保留。');
+        notify('样本已被另一窗口删除', 'error');
+      } else {
+        setFormError(`写入失败（${err instanceof Error ? err.message : '未知错误'}），草稿已保留。`);
+        notify('保存失败，草稿已保留', 'error');
+      }
+    }
+  };
+
+  const toggleStorage = async (force = false) => {
+    setFormError(null);
+    setPendingToggle(true);
+    try {
+      await updateSample(
+        sample.id,
+        { storage: sample.storage === 'loan-out' ? 'cabinet-a' : 'loan-out' },
+        { expectedUpdatedAt: sample.updatedAt, force },
+      );
+      notify('已切换存放状态');
+    } catch (err) {
+      if (err instanceof StaleWriteError) {
+        const latest = useSampleStore.getState().samples.find((s) => s.id === sample.id);
+        if (!latest) {
+          setFormError('该样本已被另一个窗口删除。');
+          return;
+        }
+        setConflict({
+          kind: 'sample',
+          title: `${sample.sampleNo} 存放状态`,
+          expectedUpdatedAt: err.expectedUpdatedAt,
+          currentUpdatedAt: err.currentUpdatedAt,
+          diffLines: diffRecords(sample, latest, [
+            { key: 'sampleNo', label: '编号' },
+            { key: 'storage', label: '存放位置', format: (v) => STORAGE_LABELS[v as keyof typeof STORAGE_LABELS] },
+            { key: 'totalWeight', label: '总重量', format: (v) => formatWeight(Number(v)) },
+            { key: 'note', label: '备注' },
+          ]),
+        });
+      } else if (err instanceof RecordGoneError) {
+        setFormError('该样本已被另一个窗口删除。');
+      } else {
+        setFormError(`保存失败（${err instanceof Error ? err.message : '未知错误'}），未覆盖任何内容。`);
+      }
+    } finally {
+      setPendingToggle(false);
+    }
   };
 
   return (
@@ -140,6 +247,24 @@ export default function Detail() {
         </Button>
         <Typography variant="h4">样本详情</Typography>
       </Stack>
+
+      {formError ? <Alert severity="error">{formError}</Alert> : null}
+
+      <ConflictDialog
+        conflict={conflict}
+        onClose={() => setConflict(null)}
+        onReload={() => {
+          // 显式重查一次，确保展示的是库里最新内容（不只依赖变更通知时序）
+          void useSampleStore.getState().refreshFromRemote().then(() => {
+            setConflict(null);
+            notify('已载入另一个窗口写入的最新内容', 'info');
+          });
+        }}
+        onForceSave={() => {
+          setConflict(null);
+          void toggleStorage(true);
+        }}
+      />
 
       <Grid container spacing={2.5}>
         <Grid item xs={12} md={4}>
@@ -159,10 +284,8 @@ export default function Detail() {
                 <Button
                   size="small"
                   variant="outlined"
-                  onClick={() => {
-                    void updateSample(sample.id, { storage: sample.storage === 'loan-out' ? 'cabinet-a' : 'loan-out' });
-                    notify('已切换存放状态');
-                  }}
+                  onClick={() => void toggleStorage(false)}
+                  disabled={pendingToggle}
                 >
                   切换存放状态
                 </Button>
@@ -315,6 +438,11 @@ export default function Detail() {
             <Typography variant="subtitle1" fontWeight={700} sx={{ mb: 1 }}>
               就地新增切片
             </Typography>
+            {sectionForm.restored ? (
+              <Alert severity="info" sx={{ mb: 1.5 }}>
+                已恢复本样本上次未提交的切片录入内容（失败或关闭页面都不会丢失）。
+              </Alert>
+            ) : null}
             <Stack spacing={1.5}>
               <Stack direction="row" spacing={1.5} flexWrap="wrap" useFlexGap>
                 <TextField
@@ -322,7 +450,7 @@ export default function Detail() {
                   size="small"
                   label="切片编号"
                   value={sectionDraft.sectionNo}
-                  onChange={(e) => setSectionDraft((d) => ({ ...d, sectionNo: e.target.value }))}
+                  onChange={(e) => patchSection({ sectionNo: e.target.value })}
                   sx={{ width: 180 }}
                 />
                 <TextField
@@ -331,7 +459,7 @@ export default function Detail() {
                   type="number"
                   label="厚度 μm"
                   value={sectionDraft.thickness}
-                  onChange={(e) => setSectionDraft((d) => ({ ...d, thickness: Number(e.target.value) }))}
+                  onChange={(e) => patchSection({ thickness: Number(e.target.value) })}
                   sx={{ width: 140 }}
                 />
                 <FormControl size="small" sx={{ minWidth: 150 }}>
@@ -341,7 +469,7 @@ export default function Detail() {
                     label="制样方式"
                     value={sectionDraft.preparation}
                     onChange={(e) =>
-                      setSectionDraft((d) => ({ ...d, preparation: e.target.value as PreparationMethod }))
+                      patchSection({ preparation: e.target.value as PreparationMethod })
                     }
                   >
                     {PREPARATIONS.map((p) => (
@@ -357,9 +485,7 @@ export default function Detail() {
                     labelId="quality-label"
                     label="质量标注"
                     value={sectionDraft.quality}
-                    onChange={(e) =>
-                      setSectionDraft((d) => ({ ...d, quality: e.target.value as SectionQuality }))
-                    }
+                    onChange={(e) => patchSection({ quality: e.target.value as SectionQuality })}
                   >
                     {SECTION_QUALITIES.map((q) => (
                       <MenuItem key={q} value={q}>
@@ -373,7 +499,7 @@ export default function Detail() {
                   size="small"
                   label="显微照片文件名"
                   value={sectionDraft.micrograph}
-                  onChange={(e) => setSectionDraft((d) => ({ ...d, micrograph: e.target.value }))}
+                  onChange={(e) => patchSection({ micrograph: e.target.value })}
                   sx={{ width: 220 }}
                 />
               </Stack>
@@ -388,7 +514,7 @@ export default function Detail() {
                     max={100}
                     value={sectionDraft.minerals[k]}
                     onChange={(v) =>
-                      setSectionDraft((d) => ({ ...d, minerals: { ...d.minerals, [k]: v } }))
+                      patchSection({ minerals: { ...sectionDraft.minerals, [k]: v } })
                     }
                     inputId={`mineral-${k}`}
                     label={MINERAL_LABELS[k]}
@@ -401,7 +527,7 @@ export default function Detail() {
               <Button
                 variant="contained"
                 startIcon={<AddIcon />}
-                onClick={submitSection}
+                onClick={() => void submitSection()}
                 id="add-section"
                 sx={{ alignSelf: 'flex-start' }}
               >
@@ -450,6 +576,11 @@ export default function Detail() {
             <Typography variant="subtitle1" fontWeight={700} sx={{ mb: 1 }}>
               就地录入检测数值
             </Typography>
+            {analysisForm.restored ? (
+              <Alert severity="info" sx={{ mb: 1.5 }}>
+                已恢复本样本上次未提交的检测数值。
+              </Alert>
+            ) : null}
             <Stack spacing={1.5}>
               <Stack direction="row" spacing={1.5} flexWrap="wrap" useFlexGap>
                 <FormControl size="small" sx={{ minWidth: 150 }}>
@@ -459,7 +590,7 @@ export default function Detail() {
                     label="检测方法"
                     value={analysisDraft.method}
                     onChange={(e) =>
-                      setAnalysisDraft((d) => ({ ...d, method: e.target.value as AnalysisMethod }))
+                      patchAnalysis({ method: e.target.value as AnalysisMethod })
                     }
                   >
                     {ANALYSIS_METHODS.map((m) => (
@@ -476,7 +607,7 @@ export default function Detail() {
                   label="检测日期"
                   InputLabelProps={{ shrink: true }}
                   value={analysisDraft.testedAt}
-                  onChange={(e) => setAnalysisDraft((d) => ({ ...d, testedAt: e.target.value }))}
+                  onChange={(e) => patchAnalysis({ testedAt: e.target.value })}
                   sx={{ width: 180 }}
                 />
               </Stack>
@@ -487,7 +618,7 @@ export default function Detail() {
                   min={0}
                   max={30}
                   value={analysisDraft.fa}
-                  onChange={(v) => setAnalysisDraft((d) => ({ ...d, fa: v }))}
+                  onChange={(v) => patchAnalysis({ fa: v })}
                   inputId="detail-fa"
                   label="Fa"
                 />
@@ -497,7 +628,7 @@ export default function Detail() {
                   min={0}
                   max={30}
                   value={analysisDraft.fs}
-                  onChange={(v) => setAnalysisDraft((d) => ({ ...d, fs: v }))}
+                  onChange={(v) => patchAnalysis({ fs: v })}
                   inputId="detail-fs"
                   label="Fs"
                 />
@@ -507,7 +638,7 @@ export default function Detail() {
                   min={0}
                   max={20}
                   value={analysisDraft.ni}
-                  onChange={(v) => setAnalysisDraft((d) => ({ ...d, ni: v }))}
+                  onChange={(v) => patchAnalysis({ ni: v })}
                   inputId="detail-ni"
                   label="Ni"
                 />
@@ -517,7 +648,7 @@ export default function Detail() {
                   min={0}
                   max={2}
                   value={analysisDraft.kamaciteBandwidth}
-                  onChange={(v) => setAnalysisDraft((d) => ({ ...d, kamaciteBandwidth: v }))}
+                  onChange={(v) => patchAnalysis({ kamaciteBandwidth: v })}
                   inputId="detail-band"
                   label="带宽"
                 />
@@ -532,7 +663,7 @@ export default function Detail() {
               <Button
                 variant="contained"
                 startIcon={<AddIcon />}
-                onClick={submitAnalysis}
+                onClick={() => void submitAnalysis()}
                 id="add-analysis"
                 sx={{ alignSelf: 'flex-start' }}
               >

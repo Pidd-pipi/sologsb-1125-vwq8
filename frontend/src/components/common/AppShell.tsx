@@ -21,6 +21,8 @@ import { ThemeProvider, createTheme } from '@mui/material/styles';
 import PublicIcon from '@mui/icons-material/Public';
 import { useSampleStore } from '../../stores/sampleStore';
 import { useToastStore } from '../../stores/uiStore';
+import { useRemoteSync } from '../../hooks/useRemoteSync';
+import { startHeartbeat } from '../../utils/tab';
 
 const DRAWER_WIDTH = 232;
 
@@ -58,6 +60,10 @@ export default function AppShell({ children }: { children: ReactNode }) {
     if (!loaded) void loadAll();
   }, [loaded, loadAll]);
 
+  // 另一窗口写入后重查库；心跳让已关闭窗口的草稿槽可被安全接续
+  useRemoteSync();
+  useEffect(() => startHeartbeat(), []);
+
   return (
     <ThemeProvider theme={theme}>
       <CssBaseline />
@@ -79,7 +85,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
             />
             <Box sx={{ flex: 1 }} />
             <Typography variant="caption" sx={{ opacity: 0.8 }}>
-              数据仅存于本机浏览器 · IndexedDB
+              数据存于本机 IndexedDB · 多窗口自动同步
             </Typography>
           </Toolbar>
         </AppBar>
