@@ -73,6 +73,7 @@ export default function Analysis() {
 
   const { value, patch, reset, clear, restored } = useLocalDraft<AnalysisDraft>('analysis-entry', initial);
   const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
 
   const sampleSections = useMemo(
     () => sections.filter((s) => s.sampleId === value.sampleId),
@@ -93,20 +94,29 @@ export default function Analysis() {
       return;
     }
     setError(null);
-    await addAnalysis({
-      sampleId: value.sampleId,
-      sectionId: value.target === 'section' ? value.sectionId : undefined,
-      target: value.target,
-      method: value.method,
-      fa: Number(value.fa),
-      fs: Number(value.fs),
-      ni: Number(value.ni),
-      kamaciteBandwidth: Number(value.kamaciteBandwidth),
-      testedAt: value.testedAt,
-    });
-    clear();
-    notify('检测记录已写入本地库');
-    patch({ fa: 18.5, fs: 16, ni: 0.8, kamaciteBandwidth: 0.05 });
+    setSaving(true);
+    try {
+      await addAnalysis({
+        sampleId: value.sampleId,
+        sectionId: value.target === 'section' ? value.sectionId : undefined,
+        target: value.target,
+        method: value.method,
+        fa: Number(value.fa),
+        fs: Number(value.fs),
+        ni: Number(value.ni),
+        kamaciteBandwidth: Number(value.kamaciteBandwidth),
+        testedAt: value.testedAt,
+      });
+      // 仅写入成功后清草稿；失败时数值原样保留，重开窗口可继续录入
+      clear();
+      notify('检测记录已写入本地库');
+      patch({ fa: 18.5, fs: 16, ni: 0.8, kamaciteBandwidth: 0.05 });
+    } catch {
+      setError('写入本地库失败，检测录入草稿已保留，可稍后重试或重开窗口恢复。');
+      notify('保存失败，草稿已保留', 'error');
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -254,8 +264,8 @@ export default function Analysis() {
               </Stack>
 
               <Stack direction="row" spacing={1.5}>
-                <Button variant="contained" startIcon={<SaveIcon />} onClick={submit} id="save-analysis">
-                  保存检测记录
+                <Button variant="contained" startIcon={<SaveIcon />} onClick={() => void submit()} id="save-analysis" disabled={saving}>
+                  {saving ? '保存中…' : '保存检测记录'}
                 </Button>
                 <Button variant="outlined" onClick={reset}>
                   清空并重置草稿

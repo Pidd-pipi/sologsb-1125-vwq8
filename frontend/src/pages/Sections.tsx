@@ -21,6 +21,7 @@ import ClassificationBadge from '../components/common/Badge';
 import { useSampleFilter } from '../hooks/useSampleFilter';
 import { useSampleStore } from '../stores/sampleStore';
 import { useToastStore } from '../stores/uiStore';
+import { isStaleWriteError } from '../db/errors';
 import {
   MINERAL_KEYS,
   MINERAL_LABELS,
@@ -67,8 +68,29 @@ export default function Sections() {
 
   const bulkLabel = async (quality: SectionQuality) => {
     if (!selected.length) return;
-    await Promise.all(selected.map((id) => updateSection(id, { quality })));
-    notify(`已批量标注 ${selected.length} 张切片为「${SECTION_QUALITY_LABELS[quality]}」`);
+    let skipped = 0;
+    const results = await Promise.allSettled(
+      selected.map((id) => {
+        const current = sections.find((s) => s.id === id);
+        // 带版本提交：另一窗口刚标注过的切片不覆盖，跳过并保留其结果
+        return updateSection(id, { quality }, current?.updatedAt ?? -1);
+      }),
+    );
+    results.forEach((r) => {
+      if (r.status === 'rejected') {
+        if (isStaleWriteError(r.reason)) skipped += 1;
+      }
+    });
+    const done = results.filter((r) => r.status === 'fulfilled').length;
+    if (done) {
+      notify(`已批量标注 ${done} 张切片为「${SECTION_QUALITY_LABELS[quality]}」`);
+    }
+    if (skipped) {
+      notify(
+        `${skipped} 张切片刚被另一窗口标注，已跳过未覆盖；列表已刷新到最新`,
+        'warning',
+      );
+    }
     setSelected([]);
   };
 

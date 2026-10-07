@@ -22,8 +22,10 @@ import SampleCard from '../components/common/SampleCard';
 import FieldGroup from '../components/common/FieldGroup';
 import ClassificationBadge from '../components/common/Badge';
 import EmptyState from '../components/common/EmptyState';
+import { useLocalDraft } from '../hooks/useLocalDraft';
 import { useSampleStore } from '../stores/sampleStore';
 import { useToastStore } from '../stores/uiStore';
+import { isStaleWriteError, isUniqueConflictError } from '../db/errors';
 import {
   ANALYSIS_METHODS,
   ANALYSIS_METHOD_LABELS,
@@ -62,6 +64,7 @@ export default function Detail() {
   const addSection = useSampleStore((s) => s.addSection);
   const addAnalysis = useSampleStore((s) => s.addAnalysis);
   const updateSample = useSampleStore((s) => s.updateSample);
+  const recommendSectionNo = useSampleStore((s) => s.recommendSectionNo);
   const notify = useToastStore((s) => s.notify);
 
   const sample = useMemo(() => samples.find((s) => s.id === id), [samples, id]);
@@ -69,29 +72,54 @@ export default function Detail() {
   const mySections = useMemo(() => sections.filter((s) => s.sampleId === id), [sections, id]);
   const myAnalysis = useMemo(() => analysis.filter((a) => a.sampleId === id), [analysis, id]);
 
-  const [sectionDraft, setSectionDraft] = useState({
-    sectionNo: '',
-    thickness: 30,
-    preparation: 'resin' as PreparationMethod,
-    quality: 'unrated' as SectionQuality,
-    micrograph: '',
-    minerals: { olivine: 40, pyroxene: 25, feldspar: 15, metal: 20 } as MineralRatios,
-  });
-  const [analysisDraft, setAnalysisDraft] = useState({
-    method: 'microprobe' as AnalysisMethod,
-    fa: 18,
-    fs: 16,
-    ni: 0.8,
-    kamaciteBandwidth: 0.05,
-    testedAt: new Date().toISOString().slice(0, 10),
-  });
+  // 就地切片 / 检测草稿同样落 localStorage（按样本 id 分键），写入失败或关掉窗口都不丢
+  const {
+    value: sectionDraft,
+    patch: patchSection,
+    reset: resetSectionDraft,
+    restored: sectionDraftRestored,
+  } = useLocalDraft(
+    `detail-section:${id}`,
+    {
+      sectionNo: '',
+      thickness: 30,
+      preparation: 'resin' as PreparationMethod,
+      quality: 'unrated' as SectionQuality,
+      micrograph: '',
+      minerals: { olivine: 40, pyroxene: 25, feldspar: 15, metal: 20 } as MineralRatios,
+    },
+    { resetKey: id },
+  );
+  const {
+    value: analysisDraft,
+    patch: patchAnalysis,
+    reset: resetAnalysisDraft,
+    restored: analysisDraftRestored,
+  } = useLocalDraft(
+    `detail-analysis:${id}`,
+    {
+      method: 'microprobe' as AnalysisMethod,
+      fa: 18,
+      fs: 16,
+      ni: 0.8,
+      kamaciteBandwidth: 0.05,
+      testedAt: new Date().toISOString().slice(0, 10),
+    },
+    { resetKey: id },
+  );
+
+  const [sectionConflict, setSectionConflict] = useState<{ value: string; suggestion?: string } | null>(
+    null,
+  );
+  const [sectionSaving, setSectionSaving] = useState(false);
+  const [analysisSaving, setAnalysisSaving] = useState(false);
 
   if (!sample) {
     return (
       <Stack spacing={2}>
         <EmptyState
           title="未找到该样本档案"
-          description={`样本 id「${id}」不在本地库中，可能已被删除或链接失效。`}
+          description={`样本 id「${id}」不在本地库中，可能已被另一个窗口删除或链接失效。`}
           actionLabel="返回样本总览"
           actionTo="/"
         />
@@ -103,33 +131,86 @@ export default function Detail() {
   const advice = classifyByAnalysis(analysisDraft);
   const hits = evaluateThresholds(analysisDraft);
 
+  const fillSuggestedSectionNo = async () => {
+    patchSection({ sectionNo: await recommendSectionNo() });
+    setSectionConflict(null);
+  };
+
   const submitSection = async () => {
-    const no = sectionDraft.sectionNo.trim() || `TS-${new Date().getFullYear()}-${mySections.length + 1}`.padEnd(3, '0');
-    await addSection({
-      sectionNo: no,
-      sampleId: sample.id,
-      thickness: Number(sectionDraft.thickness),
-      preparation: sectionDraft.preparation,
-      minerals: sectionDraft.minerals,
-      micrographs: sectionDraft.micrograph.trim() ? [sectionDraft.micrograph.trim()] : [],
-      quality: sectionDraft.quality,
-    });
-    notify(`已为 ${sample.sampleNo} 新增切片 ${no}`);
-    setSectionDraft((d) => ({ ...d, sectionNo: '', micrograph: '' }));
+    const no = sectionDraft.sectionNo.trim();
+    if (!no) {
+      await fillSuggestedSectionNo();
+      notify('已按库内现状填入下一个切片编号，请确认后再次保存');
+      return;
+    }
+    setSectionSaving(true);
+    try {
+      await addSection({
+        sectionNo: no,
+        sampleId: sample.id,
+        thickness: Number(sectionDraft.thickness),
+        preparation: sectionDraft.preparation,
+        minerals: sectionDraft.minerals,
+        micrographs: sectionDraft.micrograph.trim() ? [sectionDraft.micrograph.trim()] : [],
+        quality: sectionDraft.quality,
+      });
+      notify(`已为 ${sample.sampleNo} 新增切片 ${no}`);
+      resetSectionDraft();
+    } catch (err) {
+      if (isUniqueConflictError(err)) {
+        setSectionConflict({ value: err.value, suggestion: err.suggestion });
+        notify(`切片编号 ${err.value} 已被另一窗口登记，草稿已保留`, 'warning');
+      } else {
+        notify('切片写入失败，草稿已保留，可稍后重试', 'error');
+      }
+    } finally {
+      setSectionSaving(false);
+    }
   };
 
   const submitAnalysis = async () => {
-    await addAnalysis({
-      sampleId: sample.id,
-      target: 'sample',
-      method: analysisDraft.method,
-      fa: Number(analysisDraft.fa),
-      fs: Number(analysisDraft.fs),
-      ni: Number(analysisDraft.ni),
-      kamaciteBandwidth: Number(analysisDraft.kamaciteBandwidth),
-      testedAt: analysisDraft.testedAt,
-    });
-    notify(`已为 ${sample.sampleNo} 写入一条检测记录`);
+    setAnalysisSaving(true);
+    try {
+      await addAnalysis({
+        sampleId: sample.id,
+        target: 'sample',
+        method: analysisDraft.method,
+        fa: Number(analysisDraft.fa),
+        fs: Number(analysisDraft.fs),
+        ni: Number(analysisDraft.ni),
+        kamaciteBandwidth: Number(analysisDraft.kamaciteBandwidth),
+        testedAt: analysisDraft.testedAt,
+      });
+      notify(`已为 ${sample.sampleNo} 写入一条检测记录`);
+      resetAnalysisDraft();
+    } catch {
+      notify('检测记录写入失败，录入内容已保留', 'error');
+    } finally {
+      setAnalysisSaving(false);
+    }
+  };
+
+  const toggleStorage = async () => {
+    try {
+      // 带上当前版本：另一窗口先改过存放状态时本次切换会被拒绝，不会盖掉对方结果
+      await updateSample(
+        sample.id,
+        { storage: sample.storage === 'loan-out' ? 'cabinet-a' : 'loan-out' },
+        sample.updatedAt,
+      );
+      notify('已切换存放状态');
+    } catch (err) {
+      if (isStaleWriteError(err)) {
+        notify(
+          err.kind === 'deleted'
+            ? '该样本刚被另一窗口删除，存放状态未修改'
+            : '存放状态刚被另一窗口修改，本窗口内容已落后，已为你刷新到最新',
+          'warning',
+        );
+      } else {
+        notify('存放状态修改失败，请重试', 'error');
+      }
+    }
   };
 
   return (
@@ -159,10 +240,7 @@ export default function Detail() {
                 <Button
                   size="small"
                   variant="outlined"
-                  onClick={() => {
-                    void updateSample(sample.id, { storage: sample.storage === 'loan-out' ? 'cabinet-a' : 'loan-out' });
-                    notify('已切换存放状态');
-                  }}
+                  onClick={() => void toggleStorage()}
                 >
                   切换存放状态
                 </Button>
@@ -315,23 +393,54 @@ export default function Detail() {
             <Typography variant="subtitle1" fontWeight={700} sx={{ mb: 1 }}>
               就地新增切片
             </Typography>
+            {sectionDraftRestored ? (
+              <Alert severity="info" sx={{ mb: 1 }}>
+                已恢复上次未提交的切片录入草稿（本地保存）。
+              </Alert>
+            ) : null}
+            {sectionConflict ? (
+              <Alert
+                severity="warning"
+                sx={{ mb: 1 }}
+                action={
+                  sectionConflict.suggestion ? (
+                    <Button
+                      id="use-suggested-section-no"
+                      color="inherit"
+                      size="small"
+                      onClick={() => void fillSuggestedSectionNo()}
+                    >
+                      改用 {sectionConflict.suggestion}
+                    </Button>
+                  ) : undefined
+                }
+              >
+                切片编号「{sectionConflict.value}」刚被另一窗口登记占用，本次未写入、草稿仍在。
+              </Alert>
+            ) : null}
             <Stack spacing={1.5}>
               <Stack direction="row" spacing={1.5} flexWrap="wrap" useFlexGap>
                 <TextField
                   id="section-no"
                   size="small"
-                  label="切片编号"
+                  label="切片编号（留空点保存可自动取号）"
                   value={sectionDraft.sectionNo}
-                  onChange={(e) => setSectionDraft((d) => ({ ...d, sectionNo: e.target.value }))}
-                  sx={{ width: 180 }}
+                  onChange={(e) => {
+                    patchSection({ sectionNo: e.target.value });
+                    setSectionConflict(null);
+                  }}
+                  sx={{ width: 240 }}
                 />
+                <Button size="small" variant="outlined" onClick={() => void fillSuggestedSectionNo()}>
+                  按库内现状取号
+                </Button>
                 <TextField
                   id="section-thickness"
                   size="small"
                   type="number"
                   label="厚度 μm"
                   value={sectionDraft.thickness}
-                  onChange={(e) => setSectionDraft((d) => ({ ...d, thickness: Number(e.target.value) }))}
+                  onChange={(e) => patchSection({ thickness: Number(e.target.value) })}
                   sx={{ width: 140 }}
                 />
                 <FormControl size="small" sx={{ minWidth: 150 }}>
@@ -341,7 +450,7 @@ export default function Detail() {
                     label="制样方式"
                     value={sectionDraft.preparation}
                     onChange={(e) =>
-                      setSectionDraft((d) => ({ ...d, preparation: e.target.value as PreparationMethod }))
+                      patchSection({ preparation: e.target.value as PreparationMethod })
                     }
                   >
                     {PREPARATIONS.map((p) => (
@@ -358,7 +467,7 @@ export default function Detail() {
                     label="质量标注"
                     value={sectionDraft.quality}
                     onChange={(e) =>
-                      setSectionDraft((d) => ({ ...d, quality: e.target.value as SectionQuality }))
+                      patchSection({ quality: e.target.value as SectionQuality })
                     }
                   >
                     {SECTION_QUALITIES.map((q) => (
@@ -373,7 +482,7 @@ export default function Detail() {
                   size="small"
                   label="显微照片文件名"
                   value={sectionDraft.micrograph}
-                  onChange={(e) => setSectionDraft((d) => ({ ...d, micrograph: e.target.value }))}
+                  onChange={(e) => patchSection({ micrograph: e.target.value })}
                   sx={{ width: 220 }}
                 />
               </Stack>
@@ -388,7 +497,7 @@ export default function Detail() {
                     max={100}
                     value={sectionDraft.minerals[k]}
                     onChange={(v) =>
-                      setSectionDraft((d) => ({ ...d, minerals: { ...d.minerals, [k]: v } }))
+                      patchSection({ minerals: { ...sectionDraft.minerals, [k]: v } })
                     }
                     inputId={`mineral-${k}`}
                     label={MINERAL_LABELS[k]}
@@ -401,11 +510,12 @@ export default function Detail() {
               <Button
                 variant="contained"
                 startIcon={<AddIcon />}
-                onClick={submitSection}
+                onClick={() => void submitSection()}
                 id="add-section"
+                disabled={sectionSaving}
                 sx={{ alignSelf: 'flex-start' }}
               >
-                新增切片
+                {sectionSaving ? '保存中…' : '新增切片'}
               </Button>
             </Stack>
           </Paper>
@@ -450,6 +560,11 @@ export default function Detail() {
             <Typography variant="subtitle1" fontWeight={700} sx={{ mb: 1 }}>
               就地录入检测数值
             </Typography>
+            {analysisDraftRestored ? (
+              <Alert severity="info" sx={{ mb: 1 }}>
+                已恢复上次未提交的检测录入草稿（本地保存）。
+              </Alert>
+            ) : null}
             <Stack spacing={1.5}>
               <Stack direction="row" spacing={1.5} flexWrap="wrap" useFlexGap>
                 <FormControl size="small" sx={{ minWidth: 150 }}>
@@ -459,7 +574,7 @@ export default function Detail() {
                     label="检测方法"
                     value={analysisDraft.method}
                     onChange={(e) =>
-                      setAnalysisDraft((d) => ({ ...d, method: e.target.value as AnalysisMethod }))
+                      patchAnalysis({ method: e.target.value as AnalysisMethod })
                     }
                   >
                     {ANALYSIS_METHODS.map((m) => (
@@ -476,7 +591,7 @@ export default function Detail() {
                   label="检测日期"
                   InputLabelProps={{ shrink: true }}
                   value={analysisDraft.testedAt}
-                  onChange={(e) => setAnalysisDraft((d) => ({ ...d, testedAt: e.target.value }))}
+                  onChange={(e) => patchAnalysis({ testedAt: e.target.value })}
                   sx={{ width: 180 }}
                 />
               </Stack>
@@ -487,7 +602,7 @@ export default function Detail() {
                   min={0}
                   max={30}
                   value={analysisDraft.fa}
-                  onChange={(v) => setAnalysisDraft((d) => ({ ...d, fa: v }))}
+                  onChange={(v) => patchAnalysis({ fa: v })}
                   inputId="detail-fa"
                   label="Fa"
                 />
@@ -497,7 +612,7 @@ export default function Detail() {
                   min={0}
                   max={30}
                   value={analysisDraft.fs}
-                  onChange={(v) => setAnalysisDraft((d) => ({ ...d, fs: v }))}
+                  onChange={(v) => patchAnalysis({ fs: v })}
                   inputId="detail-fs"
                   label="Fs"
                 />
@@ -507,7 +622,7 @@ export default function Detail() {
                   min={0}
                   max={20}
                   value={analysisDraft.ni}
-                  onChange={(v) => setAnalysisDraft((d) => ({ ...d, ni: v }))}
+                  onChange={(v) => patchAnalysis({ ni: v })}
                   inputId="detail-ni"
                   label="Ni"
                 />
@@ -517,7 +632,7 @@ export default function Detail() {
                   min={0}
                   max={2}
                   value={analysisDraft.kamaciteBandwidth}
-                  onChange={(v) => setAnalysisDraft((d) => ({ ...d, kamaciteBandwidth: v }))}
+                  onChange={(v) => patchAnalysis({ kamaciteBandwidth: v })}
                   inputId="detail-band"
                   label="带宽"
                 />
@@ -532,11 +647,12 @@ export default function Detail() {
               <Button
                 variant="contained"
                 startIcon={<AddIcon />}
-                onClick={submitAnalysis}
+                onClick={() => void submitAnalysis()}
                 id="add-analysis"
+                disabled={analysisSaving}
                 sx={{ alignSelf: 'flex-start' }}
               >
-                写入检测记录
+                {analysisSaving ? '保存中…' : '写入检测记录'}
               </Button>
               <Typography variant="caption" color="text.secondary">
                 阈值参考：

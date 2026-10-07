@@ -21,6 +21,7 @@ import { ThemeProvider, createTheme } from '@mui/material/styles';
 import PublicIcon from '@mui/icons-material/Public';
 import { useSampleStore } from '../../stores/sampleStore';
 import { useToastStore } from '../../stores/uiStore';
+import { useCrossTabSync } from '../../hooks/useCrossTabSync';
 
 const DRAWER_WIDTH = 232;
 
@@ -51,12 +52,16 @@ export default function AppShell({ children }: { children: ReactNode }) {
   const loadAll = useSampleStore((s) => s.loadAll);
   const loaded = useSampleStore((s) => s.loaded);
   const sampleCount = useSampleStore((s) => s.samples.length);
+  const refreshing = useSampleStore((s) => s.refreshing);
   const toast = useToastStore();
   const location = useLocation();
 
   useEffect(() => {
     if (!loaded) void loadAll();
   }, [loaded, loadAll]);
+
+  // 订阅其他窗口的写入：任一端保存后本窗口各页与统计自动跟随
+  useCrossTabSync();
 
   return (
     <ThemeProvider theme={theme}>
@@ -77,6 +82,9 @@ export default function AppShell({ children }: { children: ReactNode }) {
               label={`本地档案 ${sampleCount} 份样本`}
               sx={{ bgcolor: 'rgba(255,255,255,0.14)', color: '#f5efe4' }}
             />
+            {refreshing ? (
+              <Chip size="small" label="同步另一窗口的改动…" sx={{ bgcolor: 'rgba(255,255,255,0.22)', color: '#f5efe4' }} />
+            ) : null}
             <Box sx={{ flex: 1 }} />
             <Typography variant="caption" sx={{ opacity: 0.8 }}>
               数据仅存于本机浏览器 · IndexedDB

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Alert,
   Box,
@@ -20,6 +20,7 @@ import CoordinatePicker from '../components/common/CoordinatePicker';
 import { useLocalDraft } from '../hooks/useLocalDraft';
 import { useSampleStore } from '../stores/sampleStore';
 import { useToastStore } from '../stores/uiStore';
+import { isUniqueConflictError } from '../db/errors';
 import {
   CHEMICAL_GROUP_LABELS,
   CHEMICAL_GROUPS,
@@ -30,7 +31,6 @@ import {
   STORAGE_LOCATIONS,
   WEATHERING_GRADES,
   WEATHERING_LABELS,
-  generateSampleNo,
   type ChemicalGroup,
   type FallOrFind,
   type SampleCategory,
@@ -68,38 +68,56 @@ interface FormDraft {
   finder: string;
 }
 
+function emptyDraft(): FormDraft {
+  return {
+    // 编号不预置：进入页面后直接查库给出权威序号，避免两个窗口拿到同一个号
+    sampleNo: '',
+    totalWeight: 0,
+    category: 'chondrite',
+    chemicalGroup: 'H',
+    weathering: 'W1',
+    fallOrFind: 'find',
+    storage: 'cabinet-a',
+    note: '',
+    withFind: true,
+    placeName: '',
+    region: '',
+    longitude: 0,
+    latitude: 0,
+    coordinateSource: 'gps',
+    environment: 'desert',
+    finder: '',
+  };
+}
+
 /** `/samples/new` 样本登记 */
 export default function New() {
   const navigate = useNavigate();
-  const nextSeq = useSampleStore((s) => s.nextSampleSeq);
-  const addSample = useSampleStore((s) => s.addSample);
-  const addFind = useSampleStore((s) => s.addFind);
+  const createSampleWithFind = useSampleStore((s) => s.createSampleWithFind);
+  const recommendSampleNo = useSampleStore((s) => s.recommendSampleNo);
   const notify = useToastStore((s) => s.notify);
 
-  const initial = useMemo<FormDraft>(
-    () => ({
-      sampleNo: generateSampleNo(new Date().getFullYear(), nextSeq()),
-      totalWeight: 0,
-      category: 'chondrite',
-      chemicalGroup: 'H',
-      weathering: 'W1',
-      fallOrFind: 'find',
-      storage: 'cabinet-a',
-      note: '',
-      withFind: true,
-      placeName: '',
-      region: '',
-      longitude: 0,
-      latitude: 0,
-      coordinateSource: 'gps',
-      environment: 'desert',
-      finder: '',
-    }),
-    [nextSeq],
-  );
-
-  const { value, patch, reset, clear, restored } = useLocalDraft<FormDraft>('sample-new', initial);
+  const { value, patch, reset, clear, restored } = useLocalDraft<FormDraft>('sample-new', emptyDraft());
   const [errors, setErrors] = useState<string[]>([]);
+  const [conflictNo, setConflictNo] = useState<string | null>(null);
+  const [suggestion, setSuggestion] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  // 只有挂载时自动建议一次，不在编辑途中覆盖用户手改的编号
+  const suggestedAtMount = useRef(false);
+
+  useEffect(() => {
+    if (suggestedAtMount.current || restored || value.sampleNo) return;
+    suggestedAtMount.current = true;
+    void recommendSampleNo().then((no) => patch({ sampleNo: no }));
+    // 仅挂载时执行
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const suggestNumber = async () => {
+    const no = await recommendSampleNo();
+    patch({ sampleNo: no });
+    setConflictNo(null);
+  };
 
   const coordError = value.withFind ? validateCoordinate(value.longitude, value.latitude) : null;
 
@@ -118,33 +136,47 @@ export default function New() {
     setErrors(list);
     if (list.length) return;
 
-    const sampleId = await addSample({
-      sampleNo: value.sampleNo.trim(),
-      totalWeight: Number(value.totalWeight),
-      category: value.category,
-      chemicalGroup: value.chemicalGroup,
-      weathering: value.weathering,
-      fallOrFind: value.fallOrFind,
-      storage: value.storage,
-      note: value.note.trim() || undefined,
-    });
-
-    if (value.withFind) {
-      await addFind({
-        sampleId,
-        placeName: value.placeName.trim(),
-        region: value.region.trim(),
-        longitude: Number(value.longitude),
-        latitude: Number(value.latitude),
-        coordinateSource: value.coordinateSource,
-        environment: value.environment,
-        finder: value.finder.trim() || '未署名',
-      });
+    const sampleNo = value.sampleNo.trim();
+    setSaving(true);
+    try {
+      const { sampleId } = await createSampleWithFind(
+        {
+          sampleNo,
+          totalWeight: Number(value.totalWeight),
+          category: value.category,
+          chemicalGroup: value.chemicalGroup,
+          weathering: value.weathering,
+          fallOrFind: value.fallOrFind,
+          storage: value.storage,
+          note: value.note.trim() || undefined,
+        },
+        value.withFind
+          ? {
+              placeName: value.placeName.trim(),
+              region: value.region.trim(),
+              longitude: Number(value.longitude),
+              latitude: Number(value.latitude),
+              coordinateSource: value.coordinateSource,
+              environment: value.environment,
+              finder: value.finder.trim() || '未署名',
+            }
+          : undefined,
+      );
+      // 只有写入真正成功才清草稿；任何失败都保留，重开窗口可恢复接着录
+      clear();
+      notify(`已登记样本 ${sampleNo}`);
+      navigate(`/samples/${sampleId}`);
+    } catch (err) {
+      if (isUniqueConflictError(err)) {
+        setConflictNo(err.value);
+        setSuggestion(err.suggestion ?? null);
+        notify(`样本编号 ${err.value} 已被另一窗口登记，草稿已保留`, 'warning');
+      } else {
+        notify('写入本地库失败，草稿已保留，可稍后重试或重开窗口恢复', 'error');
+      }
+    } finally {
+      setSaving(false);
     }
-
-    clear();
-    notify(`已登记样本 ${value.sampleNo.trim()}`);
-    navigate(`/samples/${sampleId}`);
   };
 
   return (
@@ -153,12 +185,28 @@ export default function New() {
         <Typography variant="h4">样本登记</Typography>
         <Typography variant="body2" color="text.secondary">
           分区录入编号、分类、化学群、重量与存放位置，可同时补录发现地坐标（即时校验范围）。
+          编号与保存会跨窗口校验，两个窗口不会撞号或互相覆盖。
         </Typography>
       </Box>
 
       {restored ? (
         <Alert severity="info">
           已从本地草稿恢复上次未提交的录入内容（localStorage：gbmeteorite:draft:sample-new）。
+        </Alert>
+      ) : null}
+      {conflictNo ? (
+        <Alert
+          severity="warning"
+          action={
+            suggestion ? (
+              <Button id="use-suggested-no" color="inherit" size="small" onClick={() => void suggestNumber()}>
+                改用 {suggestion}
+              </Button>
+            ) : undefined
+          }
+        >
+          样本编号「{conflictNo}」刚被另一窗口登记占用，本次保存未写入、对方内容未被覆盖，草稿仍在。
+          {suggestion ? `建议改用下一个可用编号 ${suggestion}。` : '请重新生成或手改编号后再保存。'}
         </Alert>
       ) : null}
       {errors.length ? (
@@ -178,16 +226,19 @@ export default function New() {
                 size="small"
                 label="样本编号"
                 value={value.sampleNo}
-                onChange={(e) => patch({ sampleNo: e.target.value })}
+                onChange={(e) => {
+                  patch({ sampleNo: e.target.value });
+                  setConflictNo(null);
+                }}
                 required
               />
               <Button
                 size="small"
                 variant="outlined"
-                onClick={() => patch({ sampleNo: generateSampleNo(new Date().getFullYear(), nextSeq()) })}
+                onClick={() => void suggestNumber()}
                 sx={{ alignSelf: 'flex-start' }}
               >
-                生成下一个编号
+                生成下一个编号（按库内现状）
               </Button>
             </FieldGroup>
 
@@ -389,8 +440,14 @@ export default function New() {
       </Grid>
 
       <Stack direction="row" spacing={1.5}>
-        <Button variant="contained" startIcon={<SaveIcon />} onClick={submit} id="save-sample">
-          保存样本档案
+        <Button
+          variant="contained"
+          startIcon={<SaveIcon />}
+          onClick={() => void submit()}
+          id="save-sample"
+          disabled={saving}
+        >
+          {saving ? '保存中…' : '保存样本档案'}
         </Button>
         <Button variant="outlined" startIcon={<RestartAltIcon />} onClick={reset}>
           清空并重置草稿

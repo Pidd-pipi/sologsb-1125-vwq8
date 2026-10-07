@@ -31,6 +31,8 @@ export interface ThinSection {
   micrographs: string[];
   quality: SectionQuality;
   createdAt: number;
+  /** 最后修改时间（乐观锁版本字段，v4 升级回填） */
+  updatedAt: number;
 }
 
 export const PREPARATION_LABELS: Record<PreparationMethod, string> = {

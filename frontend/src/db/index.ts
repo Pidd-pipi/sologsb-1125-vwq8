@@ -1,5 +1,4 @@
-import Dexie, { type Table } from 'dexie';
-import type { MeteoriteSample } from '../types/sample';
+import Dexie, { type Table } from 'dexie';import type { MeteoriteSample } from '../types/sample';
 import type { FindRecord } from '../types/find';
 import type { ThinSection } from '../types/section';
 import type { AnalysisRecord } from '../types/analysis';
@@ -12,6 +11,11 @@ export const DB_NAME = 'gbmeteorite-db';
  *  - v1：建 samples / finds / sections 三张表
  *  - v2：新增 analysis 表，并为 analysis 加 sampleId 索引
  *  - v3：为 samples 补 updatedAt 字段，并按 id 回填旧记录
+ *  - v4：finds / sections / analysis 补 updatedAt（乐观锁版本字段），
+ *        并把历史重号的 sampleNo / sectionNo 逐条改号（此时索引仍非唯一，
+ *        必须在唯一索引建立之前完成去重）。
+ *  - v5：sampleNo / sectionNo 升级为唯一索引（防止两个窗口同批录样撞号）。
+ *        v4 已保证无重号，建唯一索引不会失败。
  */
 export class MeteoriteDB extends Dexie {
   samples!: Table<MeteoriteSample, string>;
@@ -65,6 +69,88 @@ export class MeteoriteDB extends Dexie {
             }
           });
       });
+
+    this.version(4)
+      .stores({
+        // 仍为普通索引：本版先把历史重号消解、把 updatedAt 回填完
+        samples:
+          'id, sampleNo, category, chemicalGroup, totalWeight, createdAt, updatedAt',
+        finds: 'id, sampleId, region, createdAt, updatedAt',
+        sections:
+          'id, sectionNo, sampleId, thickness, createdAt, updatedAt',
+        analysis: 'id, sampleId, sectionId, method, testedAt, createdAt, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        // 历史数据可能有重号（旧版不拦截），必须在 v5 唯一索引建立前消解：
+        // 同编号的后续记录追加 -dup2、-dup3… 后缀。
+        await deduplicateNo(tx.table('samples'), 'sampleNo');
+        await deduplicateNo(tx.table('sections'), 'sectionNo');
+
+        await tx
+          .table<ThinSection, string>('sections')
+          .toCollection()
+          .modify((rec) => {
+            if (typeof rec.updatedAt !== 'number') {
+              rec.updatedAt = typeof rec.createdAt === 'number' ? rec.createdAt : Date.now();
+            }
+          });
+        await tx
+          .table<FindRecord, string>('finds')
+          .toCollection()
+          .modify((rec) => {
+            if (typeof rec.updatedAt !== 'number') {
+              rec.updatedAt = typeof rec.createdAt === 'number' ? rec.createdAt : Date.now();
+            }
+          });
+        await tx
+          .table<AnalysisRecord, string>('analysis')
+          .toCollection()
+          .modify((rec) => {
+            if (typeof rec.updatedAt !== 'number') {
+              rec.updatedAt = typeof rec.createdAt === 'number' ? rec.createdAt : Date.now();
+            }
+          });
+      });
+
+    this.version(5)
+      .stores({
+        // &sampleNo / &sectionNo 为唯一索引，撞号写入会被 IndexedDB 直接拒绝。
+        // v4 已消解全部历史重号，此处升唯一索引不会失败。
+        samples:
+          'id, &sampleNo, category, chemicalGroup, totalWeight, createdAt, updatedAt',
+        finds: 'id, sampleId, region, createdAt, updatedAt',
+        sections:
+          'id, &sectionNo, sampleId, thickness, createdAt, updatedAt',
+        analysis: 'id, sampleId, sectionId, method, testedAt, createdAt, updatedAt',
+      });
+  }
+}
+
+/** 给某个编号字段去重：保留首次出现的值，之后的重号追加后缀 */
+async function deduplicateNo<T extends { id: string }>(
+  table: Table<T, string>,
+  field: 'sampleNo' | 'sectionNo',
+): Promise<void> {
+  const rows = (await table.toCollection().sortBy('createdAt')) as Array<T & Record<string, unknown>>;
+  const taken = new Set<string>();
+  for (const row of rows) {
+    const raw = row[field];
+    const value =
+      typeof raw === 'string' && raw.trim() ? raw.trim() : `${field}-${String(row.id)}`;
+    if (!taken.has(value)) {
+      taken.add(value);
+      continue;
+    }
+    let n = 2;
+    let candidate = `${value}-dup${n}`;
+    while (taken.has(candidate)) {
+      n += 1;
+      candidate = `${value}-dup${n}`;
+    }
+    taken.add(candidate);
+    await table.update(row.id, (obj) => {
+      (obj as Record<string, unknown>)[field] = candidate;
+    });
   }
 }
 
@@ -76,128 +162,161 @@ export function makeId(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}_${rand}`;
 }
 
+/**
+ * 基于数据库现状计算「<前缀>-<年份>-<序号>」的下一个可用编号。
+ * 直接扫库而不是读内存 store：另一个窗口刚提交的序号在这里立即可见，
+ * 两边同时点「生成下一个编号」也不会拿到同一个号。
+ */
+export async function nextYearlyNo(field: 'sampleNo' | 'sectionNo', prefix: string): Promise<string> {
+  const year = new Date().getFullYear();
+  const fullPrefix = `${prefix}-${year}-`;
+  const all = await db.table<Record<string, unknown>, string>(
+    field === 'sampleNo' ? 'samples' : 'sections',
+  ).toArray();
+  const used = all
+    .map((r) => (typeof r[field] === 'string' ? (r[field] as string) : ''))
+    .filter((no) => no.startsWith(fullPrefix))
+    .map((no) => Number(no.slice(fullPrefix.length)))
+    .filter((n) => Number.isFinite(n));
+  const max = used.length ? Math.max(...used) : 0;
+  return `${fullPrefix}${String(max + 1).padStart(3, '0')}`;
+}
+
 /** 首次运行时灌入演示档案，保证页面有可检索内容 */
 export async function seedIfEmpty(): Promise<void> {
   const count = await db.samples.count();
   if (count > 0) return;
   const now = Date.now();
-  await db.transaction('rw', db.samples, db.finds, db.sections, db.analysis, async () => {
-    await db.samples.bulkAdd([
-      {
-        id: 'sample_seed_1',
-        sampleNo: 'MET-2024-001',
-        totalWeight: 1250.4,
-        category: 'chondrite',
-        chemicalGroup: 'H',
-        weathering: 'W1',
-        fallOrFind: 'find',
-        storage: 'cabinet-a',
-        note: '撒哈拉回收，熔壳完整',
-        createdAt: now - 86400000 * 40,
-        updatedAt: now - 86400000 * 40,
-      },
-      {
-        id: 'sample_seed_2',
-        sampleNo: 'MET-2024-002',
-        totalWeight: 8420,
-        category: 'iron',
-        chemicalGroup: 'IAB',
-        weathering: 'W0',
-        fallOrFind: 'find',
-        storage: 'cabinet-b',
-        note: '八面体结构清晰',
-        createdAt: now - 86400000 * 30,
-        updatedAt: now - 86400000 * 30,
-      },
-      {
-        id: 'sample_seed_3',
-        sampleNo: 'MET-2024-003',
-        totalWeight: 318.9,
-        category: 'achondrite',
-        chemicalGroup: 'ungrouped',
-        weathering: 'W2',
-        fallOrFind: 'fall',
-        storage: 'desiccator',
-        note: '目击坠落，无熔壳',
-        createdAt: now - 86400000 * 18,
-        updatedAt: now - 86400000 * 18,
-      },
-    ]);
-    await db.finds.bulkAdd([
-      {
-        id: 'find_seed_1',
-        sampleId: 'sample_seed_1',
-        placeName: 'Dar al Gani 区域',
-        region: '利比亚',
-        longitude: 16.2,
-        latitude: 27.4,
-        coordinateSource: 'gps',
-        environment: 'desert',
-        finder: '野外队 A 组',
-        createdAt: now - 86400000 * 40,
-      },
-      {
-        id: 'find_seed_2',
-        sampleId: 'sample_seed_2',
-        placeName: 'Gobi 南缘',
-        region: '中国 内蒙古',
-        longitude: 108.6,
-        latitude: 42.1,
-        coordinateSource: 'literature',
-        environment: 'desert',
-        finder: '标本室交换',
-        createdAt: now - 86400000 * 30,
-      },
-    ]);
-    await db.sections.bulkAdd([
-      {
-        id: 'section_seed_1',
-        sectionNo: 'TS-2024-001',
-        sampleId: 'sample_seed_1',
-        thickness: 30,
-        preparation: 'resin',
-        minerals: { olivine: 42, pyroxene: 28, feldspar: 12, metal: 18 },
-        micrographs: ['met001_ppl.jpg', 'met001_xpl.jpg'],
-        quality: 'good',
-        createdAt: now - 86400000 * 35,
-      },
-      {
-        id: 'section_seed_2',
-        sectionNo: 'TS-2024-002',
-        sampleId: 'sample_seed_2',
-        thickness: 60,
-        preparation: 'epoxy',
-        minerals: { olivine: 2, pyroxene: 5, feldspar: 1, metal: 92 },
-        micrographs: ['met002_reflect.jpg'],
-        quality: 'fair',
-        createdAt: now - 86400000 * 25,
-      },
-    ]);
-    await db.analysis.bulkAdd([
-      {
-        id: 'analysis_seed_1',
-        sampleId: 'sample_seed_1',
-        target: 'sample',
-        method: 'microprobe',
-        fa: 18.6,
-        fs: 16.2,
-        ni: 0.8,
-        kamaciteBandwidth: 0.02,
-        testedAt: '2024-06-12',
-        createdAt: now - 86400000 * 20,
-      },
-      {
-        id: 'analysis_seed_2',
-        sampleId: 'sample_seed_2',
-        target: 'sample',
-        method: 'sem-eds',
-        fa: 3.2,
-        fs: 4.1,
-        ni: 7.4,
-        kamaciteBandwidth: 0.62,
-        testedAt: '2024-07-03',
-        createdAt: now - 86400000 * 12,
-      },
-    ]);
-  });
+  try {
+    await db.transaction('rw', db.samples, db.finds, db.sections, db.analysis, async () => {
+      await db.samples.bulkAdd([
+        {
+          id: 'sample_seed_1',
+          sampleNo: 'MET-2024-001',
+          totalWeight: 1250.4,
+          category: 'chondrite',
+          chemicalGroup: 'H',
+          weathering: 'W1',
+          fallOrFind: 'find',
+          storage: 'cabinet-a',
+          note: '撒哈拉回收，熔壳完整',
+          createdAt: now - 86400000 * 40,
+          updatedAt: now - 86400000 * 40,
+        },
+        {
+          id: 'sample_seed_2',
+          sampleNo: 'MET-2024-002',
+          totalWeight: 8420,
+          category: 'iron',
+          chemicalGroup: 'IAB',
+          weathering: 'W0',
+          fallOrFind: 'find',
+          storage: 'cabinet-b',
+          note: '八面体结构清晰',
+          createdAt: now - 86400000 * 30,
+          updatedAt: now - 86400000 * 30,
+        },
+        {
+          id: 'sample_seed_3',
+          sampleNo: 'MET-2024-003',
+          totalWeight: 318.9,
+          category: 'achondrite',
+          chemicalGroup: 'ungrouped',
+          weathering: 'W2',
+          fallOrFind: 'fall',
+          storage: 'desiccator',
+          note: '目击坠落，无熔壳',
+          createdAt: now - 86400000 * 18,
+          updatedAt: now - 86400000 * 18,
+        },
+      ]);
+      await db.finds.bulkAdd([
+        {
+          id: 'find_seed_1',
+          sampleId: 'sample_seed_1',
+          placeName: 'Dar al Gani 区域',
+          region: '利比亚',
+          longitude: 16.2,
+          latitude: 27.4,
+          coordinateSource: 'gps',
+          environment: 'desert',
+          finder: '野外队 A 组',
+          createdAt: now - 86400000 * 40,
+          updatedAt: now - 86400000 * 40,
+        },
+        {
+          id: 'find_seed_2',
+          sampleId: 'sample_seed_2',
+          placeName: 'Gobi 南缘',
+          region: '中国 内蒙古',
+          longitude: 108.6,
+          latitude: 42.1,
+          coordinateSource: 'literature',
+          environment: 'desert',
+          finder: '标本室交换',
+          createdAt: now - 86400000 * 30,
+          updatedAt: now - 86400000 * 30,
+        },
+      ]);
+      await db.sections.bulkAdd([
+        {
+          id: 'section_seed_1',
+          sectionNo: 'TS-2024-001',
+          sampleId: 'sample_seed_1',
+          thickness: 30,
+          preparation: 'resin',
+          minerals: { olivine: 42, pyroxene: 28, feldspar: 12, metal: 18 },
+          micrographs: ['met001_ppl.jpg', 'met001_xpl.jpg'],
+          quality: 'good',
+          createdAt: now - 86400000 * 35,
+          updatedAt: now - 86400000 * 35,
+        },
+        {
+          id: 'section_seed_2',
+          sectionNo: 'TS-2024-002',
+          sampleId: 'sample_seed_2',
+          thickness: 60,
+          preparation: 'epoxy',
+          minerals: { olivine: 2, pyroxene: 5, feldspar: 1, metal: 92 },
+          micrographs: ['met002_reflect.jpg'],
+          quality: 'fair',
+          createdAt: now - 86400000 * 25,
+          updatedAt: now - 86400000 * 25,
+        },
+      ]);
+      await db.analysis.bulkAdd([
+        {
+          id: 'analysis_seed_1',
+          sampleId: 'sample_seed_1',
+          target: 'sample',
+          method: 'microprobe',
+          fa: 18.6,
+          fs: 16.2,
+          ni: 0.8,
+          kamaciteBandwidth: 0.02,
+          testedAt: '2024-06-12',
+          createdAt: now - 86400000 * 20,
+          updatedAt: now - 86400000 * 20,
+        },
+        {
+          id: 'analysis_seed_2',
+          sampleId: 'sample_seed_2',
+          target: 'sample',
+          method: 'sem-eds',
+          fa: 3.2,
+          fs: 4.1,
+          ni: 7.4,
+          kamaciteBandwidth: 0.62,
+          testedAt: '2024-07-03',
+          createdAt: now - 86400000 * 12,
+          updatedAt: now - 86400000 * 12,
+        },
+      ]);
+    });
+  } catch (err) {
+    // 与另一窗口首次灌库撞车时，唯一索引会报 ConstraintError；
+    // 对方已经把演示数据写好，这里直接放弃即可。
+    if (Dexie.errnames && (err as { name?: string })?.name === Dexie.errnames.Constraint) return;
+    throw err;
+  }
 }

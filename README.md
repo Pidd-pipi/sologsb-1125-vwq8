@@ -23,6 +23,11 @@ docker compose down
 - 纯前端 SPA：**无后端、无数据库服务、无外部 API**
 - 所有数据保存在浏览器本地：业务数据走 **IndexedDB（Dexie，库名 `gbmeteorite-db`）**，表单草稿走 **localStorage**
 - 容器无状态，不挂载任何命名卷；换浏览器即换档案库
+- **多窗口协同编目**：两个窗口同时录同一批样本时——
+  - 一个窗口写入后，另一个窗口的样本总览 / 详情 / 切片库 / 分析检测 / 发现地分布自动跟随刷新，各页统计（数量、重量、地区聚合）即时重算（`BroadcastChannel`，localStorage 兜底）
+  - 样本编号 / 切片编号为数据库**唯一索引**，两边绝不会撞号；编号建议直接查库生成（`MET-年份-序号`），另一窗口刚占用的序号立即可见
+  - 样本与切片更新带 `updatedAt` **乐观锁**：数据落后的窗口再保存时会先收到「已被另一窗口修改」提示并自动刷新到最新，**不会覆盖对方结果**
+  - 写入失败（编号冲突 / 乐观锁落后 / 存储异常）一律**保留本地草稿**，关掉重开仍可恢复接着录；只有真正写入成功才清草稿
 
 ## 技术栈
 
@@ -71,10 +76,13 @@ sologsb-1125/
     ├── public/favicon.svg
     └── src/
         ├── types/{sample,find,section,analysis}.ts
-        ├── db/index.ts                 # Dexie 封装与 v1→v3 升级迁移
+        ├── db/
+        │   ├── index.ts                # Dexie 封装与 v1→v5 升级迁移、权威编号生成
+        │   ├── sync.ts                 # 跨窗口变更广播（BroadcastChannel + storage 兜底）
+        │   └── errors.ts               # StaleWriteError / UniqueConflictError
         ├── stores/{sampleStore,uiStore}.ts
         ├── components/common/{SampleCard,Badge,FieldGroup,EmptyState,CoordinatePicker,AppShell}.tsx
-        ├── hooks/{useSampleFilter,useLocalDraft,useRegionStats}.ts
+        ├── hooks/{useSampleFilter,useLocalDraft,useRegionStats,useCrossTabSync}.ts
         ├── pages/{Overview,New,Detail,Sections,Analysis,Locations}.tsx
         ├── router/index.tsx
         └── utils/{classify,format,geo}.ts
@@ -87,8 +95,11 @@ sologsb-1125/
   - v1 建 `samples` / `finds` / `sections`
   - v2 新增 `analysis` 表并加 `sampleId` 索引
   - v3 为 `samples` 补 `updatedAt` 字段并按 id 回填旧记录
-- **草稿**：`/samples/new` 与 `/analysis` 的表单草稿写入 localStorage（键前缀 `gbmeteorite:draft:`），切页自动恢复，提交后清理
-- 首次打开会灌入 3 份演示样本、2 条发现记录、2 张切片与 2 条检测记录，便于直接体验筛选与打点
+  - v4 为 `finds` / `sections` / `analysis` 补 `updatedAt`（乐观锁版本字段），并把历史重号样本/切片逐条改号（追加 `-dupN` 后缀）
+  - v5 将 `samples.sampleNo` 与 `sections.sectionNo` 升为唯一索引（去重在 v4 已完成，建唯一索引不会失败）
+- **草稿**：`/samples/new`、`/analysis` 与样本详情页就地新增切片 / 检测的表单草稿写入 localStorage（键前缀 `gbmeteorite:draft:`），切页 / 关窗自动恢复，**仅写入成功后清理**；写入失败原样保留
+- **跨窗口通知**：写操作提交后经 `BroadcastChannel`（通道 `gbmeteorite-db-changes`；不支持时回落 localStorage storage 事件，再以窗口聚焦补拉兜底）通知其他窗口静默重拉
+- 首次打开会灌入 3 份演示样本、2 条发现记录、2 张切片与 2 条检测记录，便于直接体验筛选与打点；两窗口首次同时打开撞车灌库时以唯一索引为准，落败方静默放弃
 
 ## 环境变量
 

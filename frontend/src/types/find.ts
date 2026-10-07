@@ -22,6 +22,8 @@ export interface FindRecord {
   /** 发现者 */
   finder: string;
   createdAt: number;
+  /** 最后修改时间（v4 升级回填） */
+  updatedAt: number;
 }
 
 export const COORDINATE_SOURCE_LABELS: Record<CoordinateSource, string> = {
